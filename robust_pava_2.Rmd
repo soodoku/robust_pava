@@ -1,0 +1,179 @@
+---
+title: "Isotonic Regression Analysis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Implementation of isotonic PAVA from scratch in R
+pava <- function(pred, actual, weights = rep(1, length(actual))) {
+  n <- length(actual)
+  if (n <= 1) return(actual)
+  
+  # Ensure pred and actual are sorted by pred
+  order_idx <- order(pred)
+  pred <- pred[order_idx]
+  actual <- actual[order_idx]
+  weights <- weights[order_idx]
+
+  # Initialize vectors for means and weights
+  ghat <- actual
+  w <- weights
+
+  # Optimized PAVA using a stack-based approach
+  stack <- list()
+  for (i in seq_along(actual)) {
+    stack <- append(stack, list(list(mean = ghat[i], weight = w[i], count = 1)))
+    while (length(stack) > 1 && stack[[length(stack) - 1]]$mean > stack[[length(stack)]]$mean) {
+      last <- stack[[length(stack)]]
+      second_last <- stack[[length(stack) - 1]]
+      combined_weight <- last$weight + second_last$weight
+      combined_mean <- (last$mean * last$weight + second_last$mean * second_last$weight) / combined_weight
+      stack[[length(stack) - 1]] <- list(mean = combined_mean, weight = combined_weight, count = second_last$count + last$count)
+      stack <- stack[-length(stack)]
+    }
+  }
+
+  # Expand the stack back to the original size
+  result <- numeric(n)
+  start_idx <- 1
+  for (s in stack) {
+    end_idx <- start_idx + s$count - 1
+    result[start_idx:end_idx] <- s$mean
+    start_idx <- end_idx + 1
+  }
+
+  # Reorder result back to the original order
+  result[order(order_idx)] <- result
+  return(result)
+}
+
+# Robust PAVA with threshold k
+robust_pava <- function(pred, actual, weights = rep(1, length(actual)), k = 0) {
+  n <- length(actual)
+  if (n <= 1) return(actual)
+
+  # Ensure pred and actual are sorted by pred
+  order_idx <- order(pred)
+  pred <- pred[order_idx]
+  actual <- actual[order_idx]
+  weights <- weights[order_idx]
+
+  # Initialize vectors for means and weights
+  ghat <- actual
+  w <- weights
+
+  # Optimized PAVA with a stack-based approach and threshold k
+  stack <- vector("list", n)
+  stack_size <- 0
+
+  for (i in seq_along(actual)) {
+    stack_size <- stack_size + 1
+    stack[[stack_size]] <- list(mean = ghat[i], weight = w[i], count = 1)
+
+    while (stack_size > 1) {
+      last <- stack[[stack_size]]
+      second_last <- stack[[stack_size - 1]]
+
+      if (second_last$mean > last$mean && abs(second_last$mean - last$mean) > k) {
+        combined_weight <- last$weight + second_last$weight
+        combined_mean <- (last$mean * last$weight + second_last$mean * second_last$weight) / combined_weight
+        stack[[stack_size - 1]] <- list(mean = combined_mean, weight = combined_weight, count = second_last$count + last$count)
+        stack_size <- stack_size - 1
+      } else {
+        break
+      }
+    }
+  }
+
+  # Expand the stack back to the original size
+  result <- numeric(n)
+  start_idx <- 1
+  for (j in seq_len(stack_size)) {
+    s <- stack[[j]]
+    end_idx <- start_idx + s$count - 1
+    result[start_idx:end_idx] <- s$mean
+    start_idx <- end_idx + 1
+  }
+
+  # Reorder result back to the original order
+  result[order(order_idx)] <- result
+  return(result)
+}
+
+# Calculate threshold k based on 10th percentile of first differences
+calculate_k <- function(predictions) {
+  diff_series <- diff(predictions)
+  diff_series <- diff_series[diff_series != 0]  # Remove zero differences
+  if (length(diff_series) == 0) return(0)  # Handle case where all differences are zero
+  k <- quantile(abs(diff_series), 0.1, na.rm = TRUE)  # Safeguard against NA values
+  return(k)
+}
+
+# Mean Absolute Calibration Error (MACE)
+mace <- function(predicted, actual) {
+  mean(abs(predicted - actual))
+}
+
+# Benchmarking against the built-in isoreg
+benchmark_isotonic <- function(size = 1e6) {
+  # Generate realistic synthetic data
+  set.seed(123)
+  pred <- runif(size)
+  actual <- 2*pred^2 + rnorm(size, sd = 0.2)  # Sigmoidal with noise
+
+  # Custom PAVA implementation
+  custom_result <- pava(pred, actual)
+
+  # Calculate k for robust PAVA
+  k <- calculate_k(custom_result)
+
+  # Robust PAVA implementation
+  robust_result <- robust_pava(pred, actual, k = k)
+
+  # Built-in isoreg implementation
+  library_result <- isoreg(pred, actual)$yf
+
+  # Calculate MACE
+  mace_custom <- mace(custom_result, actual)
+  mace_robust <- mace(robust_result, actual)
+  mace_library <- mace(library_result, actual)
+
+  # Spearman Correlations
+  spearman_pred_actual <- cor(pred, actual, method = "spearman")
+  spearman_custom_actual <- cor(custom_result, actual, method = "spearman")
+  spearman_robust_actual <- cor(robust_result, actual, method = "spearman")
+  spearman_custom_pred <- cor(custom_result, pred, method = "spearman")
+  spearman_robust_pred <- cor(robust_result, pred, method = "spearman")
+  spearman_library_actual <- cor(library_result, pred, method = "spearman")
+
+  # Count unique values
+  unique_custom <- length(unique(custom_result))
+  unique_robust <- length(unique(robust_result))
+  unique_library <- length(unique(library_result))
+
+  # Return comparison
+  list(
+    mace_custom = mace_custom,
+    mace_robust = mace_robust,
+    mace_library = mace_library,
+    unique_values_custom = unique_custom,
+    unique_values_robust = unique_robust,
+    unique_values_library = unique_library,
+    spearman_pred_actual = spearman_pred_actual,
+    spearman_custom_actual = spearman_custom_actual,
+    spearman_robust_actual = spearman_robust_actual,
+    spearman_custom_pred = spearman_custom_pred,
+    spearman_robust_pred = spearman_robust_pred,
+    spearman_library_actual = spearman_library_actual
+  )
+}
+```
+
+# Analysis
+
+```{r example}
+# Run benchmark
+benchmark_results <- benchmark_isotonic()
+print(benchmark_results)
+```

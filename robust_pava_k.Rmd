@@ -1,0 +1,274 @@
+---
+title: "Robust PAVA Implementation and Analysis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Core Functions
+
+```{r core_functions}
+# Function to determine smart threshold from data
+determine_threshold <- function(y, percentile = 0.05) {
+  sorted_y <- sort(y)
+  diffs <- diff(sorted_y)
+  positive_diffs <- diffs[diffs > 0]
+  if(length(positive_diffs) == 0) return(0)
+  threshold <- quantile(positive_diffs, percentile)
+  threshold
+}
+
+# Traditional PAVA implementation with calibration target
+traditional_pava <- function(pred, target) {
+  # Sort everything by predictions
+  ord <- order(pred)
+  y <- target[ord]  # target values we want to match
+  w <- rep(1, length(y))  # weights
+  y_iso <- y  # isotonic regression result
+  
+  iteration <- 0
+  while(TRUE) {
+    iteration <- iteration + 1
+    violations <- which(diff(y_iso) < 0)
+    if(length(violations) == 0 || iteration > 1000) break
+    
+    i <- violations[1]
+    pool_value <- (w[i] * y_iso[i] + w[i+1] * y_iso[i+1]) / (w[i] + w[i+1])
+    y_iso[i] <- pool_value
+    y_iso[i+1] <- pool_value
+    w[i] <- w[i] + w[i+1]
+    w[i+1] <- w[i]
+  }
+  
+  # Return to original order
+  result <- y_iso[order(ord)]
+  result
+}
+
+# Robust PAVA implementation with calibration target
+robust_pava <- function(pred, target, threshold = 0.1) {
+  # Sort everything by predictions
+  ord <- order(pred)
+  y <- target[ord]  # target values we want to match
+  w <- rep(1, length(y))  # weights
+  y_iso <- y  # isotonic regression result
+  
+  iteration <- 0
+  while(TRUE) {
+    iteration <- iteration + 1
+    diffs <- diff(y_iso)
+    violations <- which(diffs < 0)
+    violations <- violations[abs(diffs[violations]) > threshold]
+    
+    if(length(violations) == 0 || iteration > 1000) break
+    
+    i <- violations[1]
+    pool_value <- (w[i] * y_iso[i] + w[i+1] * y_iso[i+1]) / (w[i] + w[i+1])
+    y_iso[i] <- pool_value
+    y_iso[i+1] <- pool_value
+    w[i] <- w[i] + w[i+1]
+    w[i+1] <- w[i]
+  }
+  
+  # Return to original order
+  result <- y_iso[order(ord)]
+  result
+}
+
+# Function to perform k-means calibration
+kmeans_calibration <- function(pred, target, k = 100) {
+  # Perform k-means on predictions
+  set.seed(123)  # for reproducibility
+  km <- kmeans(pred, centers = k)
+  
+  # For each cluster, calculate mean target value
+  cluster_means <- tapply(target, km$cluster, mean)
+  
+  # Map back to original predictions
+  result <- cluster_means[km$cluster]
+  result
+}
+
+# Calculate MACE with fine-grained bins
+calculate_mace <- function(target_probs, ref_probs, min_points_per_bin = 50) {
+  n <- length(target_probs)
+  
+  # Determine number of bins (ensuring at least min_points_per_bin per bin)
+  n_bins <- min(n %/% min_points_per_bin, 50)  # Cap at 50 bins
+  
+  # Sort by reference probabilities
+  ord <- order(ref_probs)
+  sorted_target <- target_probs[ord]
+  sorted_ref <- ref_probs[ord]
+  
+  # Create roughly equal-sized bins
+  bin_size <- ceiling(n / n_bins)
+  bins <- rep(1:n_bins, each = bin_size)[1:n]
+  
+  # Calculate means for each bin
+  target_means <- tapply(sorted_target, bins, mean)
+  ref_means <- tapply(sorted_ref, bins, mean)
+  
+  # Calculate bin sizes for weighting
+  bin_sizes <- tapply(sorted_target, bins, length)
+  
+  # Weighted mean absolute difference
+  mace <- sum(abs(target_means - ref_means) * bin_sizes) / sum(bin_sizes)
+  
+  # Return additional diagnostics
+  list(
+    mace = mace,
+    n_bins = n_bins,
+    avg_bin_size = mean(bin_sizes),
+    min_bin_size = min(bin_sizes)
+  )
+}
+
+# Generate synthetic data
+generate_synthetic_data <- function(n, bias_factor = 8, noise_sd = 0.08) {
+  # Generate true probabilities
+  x <- seq(0, 1, length.out = n)
+  true_probs <- x^2
+  
+  # Create biased predictions (sigmoid transformation)
+  biased_preds <- 1 / (1 + exp(-bias_factor * (true_probs - 0.5)))
+  
+  # Add noise
+  noise <- rnorm(n, 0, noise_sd)
+  noisy_preds <- pmax(0, pmin(1, biased_preds + noise))
+  
+  list(
+    true_probs = true_probs,
+    noisy_preds = noisy_preds,
+    biased_preds = biased_preds
+  )
+}
+
+evaluate_calibration <- function(true_probs, noisy_preds, traditional_result, robust_result, kmeans_result) {
+  # Calculate all MACE combinations
+  mace_trad_vs_true <- calculate_mace(traditional_result, true_probs)
+  mace_robust_vs_true <- calculate_mace(robust_result, true_probs)
+  mace_kmeans_vs_true <- calculate_mace(kmeans_result, true_probs)
+  mace_trad_vs_noisy <- calculate_mace(traditional_result, noisy_preds)
+  mace_robust_vs_noisy <- calculate_mace(robust_result, noisy_preds)
+  mace_kmeans_vs_noisy <- calculate_mace(kmeans_result, noisy_preds)
+  
+  # Create detailed MACE analysis table
+  detailed_mace <- data.frame(
+    Comparison = c("Traditional vs True", "Robust vs True", "K-Means vs True",
+                  "Traditional vs Noisy", "Robust vs Noisy", "K-Means vs Noisy"),
+    MACE = round(c(mace_trad_vs_true$mace, mace_robust_vs_true$mace, mace_kmeans_vs_true$mace,
+                   mace_trad_vs_noisy$mace, mace_robust_vs_noisy$mace, mace_kmeans_vs_noisy$mace), 4),
+    N_Bins = c(mace_trad_vs_true$n_bins, mace_robust_vs_true$n_bins, mace_kmeans_vs_true$n_bins,
+               mace_trad_vs_noisy$n_bins, mace_robust_vs_noisy$n_bins, mace_kmeans_vs_noisy$n_bins),
+    Avg_Bin_Size = round(c(mace_trad_vs_true$avg_bin_size, mace_robust_vs_true$avg_bin_size, mace_kmeans_vs_true$avg_bin_size,
+                          mace_trad_vs_noisy$avg_bin_size, mace_robust_vs_noisy$avg_bin_size, mace_kmeans_vs_noisy$avg_bin_size), 1),
+    Min_Bin_Size = c(mace_trad_vs_true$min_bin_size, mace_robust_vs_true$min_bin_size, mace_kmeans_vs_true$min_bin_size,
+                     mace_trad_vs_noisy$min_bin_size, mace_robust_vs_noisy$min_bin_size, mace_kmeans_vs_noisy$min_bin_size)
+  )
+  
+  cat("\nDetailed MACE Analysis:\n")
+  print(detailed_mace)
+  
+  results <- data.frame(
+    Method = c("True Probs", "Noisy Preds", "Traditional PAVA", "Robust PAVA", "K-Means"),
+    MAE = round(c(
+      0,
+      mean(abs(noisy_preds - true_probs)),
+      mean(abs(traditional_result - true_probs)),
+      mean(abs(robust_result - true_probs)),
+      mean(abs(kmeans_result - true_probs))
+    ), 3),
+    MACE_vs_True = round(c(
+      0,
+      calculate_mace(noisy_preds, true_probs)$mace,
+      mace_trad_vs_true$mace,
+      mace_robust_vs_true$mace,
+      mace_kmeans_vs_true$mace
+    ), 3),
+    MACE_vs_Noisy = round(c(
+      calculate_mace(true_probs, noisy_preds)$mace,
+      0,
+      mace_trad_vs_noisy$mace,
+      mace_robust_vs_noisy$mace,
+      mace_kmeans_vs_noisy$mace
+    ), 3),
+    Unique_Values = c(
+      length(unique(true_probs)),
+      length(unique(noisy_preds)),
+      length(unique(traditional_result)),
+      length(unique(robust_result)),
+      length(unique(kmeans_result))
+    ),
+    Spearman_True = round(c(
+      1.0,
+      cor(noisy_preds, true_probs, method = "spearman"),
+      cor(traditional_result, true_probs, method = "spearman"),
+      cor(robust_result, true_probs, method = "spearman"),
+      cor(kmeans_result, true_probs, method = "spearman")
+    ), 3),
+    Spearman_Noisy = round(c(
+      cor(true_probs, noisy_preds, method = "spearman"),
+      1.0,
+      cor(traditional_result, noisy_preds, method = "spearman"),
+      cor(robust_result, noisy_preds, method = "spearman"),
+      cor(kmeans_result, noisy_preds, method = "spearman")
+    ), 3)
+  )
+  results
+}
+```
+
+# Analysis
+
+```{r example}
+set.seed(123)
+n <- 5000
+
+# Define different simulation parameters
+sim_params <- list(
+  list(bias = 4, noise = 0.05),   # Low bias, low noise
+  list(bias = 4, noise = 0.15),   # Low bias, high noise
+  list(bias = 8, noise = 0.05),   # Medium bias, low noise
+  list(bias = 8, noise = 0.15),   # Medium bias, high noise
+  list(bias = 12, noise = 0.05),  # High bias, low noise
+  list(bias = 12, noise = 0.15),  # High bias, high noise
+  list(bias = 6, noise = 0.10),   # Medium-low bias, medium noise
+  list(bias = 10, noise = 0.10),  # Medium-high bias, medium noise
+  list(bias = 8, noise = 0.08),   # Medium everything (baseline)
+  list(bias = 15, noise = 0.20)   # Extreme case
+)
+
+# Run simulations
+for (i in seq_along(sim_params)) {
+  cat("\n\nSimulation", i, "- Bias:", sim_params[[i]]$bias, "Noise:", sim_params[[i]]$noise, "\n")
+  cat("=================================================================\n")
+  
+  # Generate data with current parameters
+  data <- generate_synthetic_data(n, bias_factor = sim_params[[i]]$bias, 
+                                noise_sd = sim_params[[i]]$noise)
+  
+  # Determine smart threshold and apply PAVA
+  smart_threshold <- determine_threshold(data$noisy_preds)
+  cat("Smart threshold determined:", round(smart_threshold, 4), "\n\n")
+  
+  # Apply all calibration methods
+  traditional_result <- traditional_pava(data$noisy_preds, data$true_probs)
+  robust_result <- robust_pava(data$noisy_preds, data$true_probs, threshold = smart_threshold)
+  kmeans_result <- kmeans_calibration(data$noisy_preds, data$true_probs, k = 100)
+  
+  # Calculate metrics
+  results <- evaluate_calibration(
+    data$true_probs,
+    data$noisy_preds,
+    traditional_result,
+    robust_result,
+    kmeans_result
+  )
+  
+  print(results)
+}
+```
